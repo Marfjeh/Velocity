@@ -32,7 +32,6 @@ import com.velocitypowered.api.event.player.PlayerChatEvent;
 import com.velocitypowered.api.event.player.PlayerClientBrandEvent;
 import com.velocitypowered.api.event.player.TabCompleteEvent;
 import com.velocitypowered.api.network.ProtocolVersion;
-import com.velocitypowered.api.proxy.crypto.IdentifiedKey;
 import com.velocitypowered.api.proxy.messages.ChannelIdentifier;
 import com.velocitypowered.api.proxy.messages.LegacyChannelIdentifier;
 import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
@@ -58,7 +57,6 @@ import com.velocitypowered.proxy.protocol.packet.TabCompleteRequest;
 import com.velocitypowered.proxy.protocol.packet.TabCompleteResponse;
 import com.velocitypowered.proxy.protocol.packet.TabCompleteResponse.Offer;
 import com.velocitypowered.proxy.protocol.packet.chat.ChatBuilder;
-import com.velocitypowered.proxy.protocol.packet.chat.ChatQueue;
 import com.velocitypowered.proxy.protocol.packet.chat.LegacyChat;
 import com.velocitypowered.proxy.protocol.packet.chat.PlayerChat;
 import com.velocitypowered.proxy.protocol.packet.chat.PlayerCommand;
@@ -140,10 +138,10 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
   }
 
   private void processCommandMessage(String message, @Nullable SignedChatCommand signedCommand,
-                                     MinecraftPacket original, Instant passedTimestamp) {
-    this.player.getChatQueue().queuePacket(server.getCommandManager().callCommandEvent(player, message)
+                                     MinecraftPacket original) {
+    server.getCommandManager().callCommandEvent(player, message)
         .thenComposeAsync(event -> processCommandExecuteResult(message,
-            event.getResult(), signedCommand, passedTimestamp))
+            event.getResult(), signedCommand))
         .whenComplete((ignored, throwable) -> {
           if (server.getConfiguration().isLogCommandExecutions()) {
             logger.info("{} -> executed command /{}", player, message);
@@ -155,7 +153,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
           player.sendMessage(Component.translatable("velocity.command.generic-error",
               NamedTextColor.RED));
           return null;
-        }), passedTimestamp);
+        });
   }
 
   private void processPlayerChat(String message, @Nullable SignedChatMessage signedMessage,
@@ -164,62 +162,24 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     if (smc == null) {
       return;
     }
-
-    if (signedMessage == null) {
-      PlayerChatEvent event = new PlayerChatEvent(player, message);
-      callChat(original, event, null).thenAccept(smc::write);
-    } else {
-      Instant messageTimestamp = signedMessage.getExpiryTemporal();
-      PlayerChatEvent event = new PlayerChatEvent(player, message);
-      this.player.getChatQueue().queuePacket(callChat(original, event, signedMessage), messageTimestamp);
-    }
-  }
-
-  private CompletableFuture<MinecraftPacket> callChat(MinecraftPacket original, PlayerChatEvent event,
-                                                      @Nullable SignedChatMessage signedMessage) {
-    return server.getEventManager().fire(event)
-        .thenApply(pme -> {
+    PlayerChatEvent event = new PlayerChatEvent(player, message);
+    server.getEventManager().fire(event)
+        .thenAcceptAsync(pme -> {
           PlayerChatEvent.ChatResult chatResult = pme.getResult();
-          IdentifiedKey playerKey = player.getIdentifiedKey();
           if (chatResult.isAllowed()) {
             Optional<String> eventMsg = pme.getResult().getMessage();
             if (eventMsg.isPresent()) {
-              String messageNew = eventMsg.get();
-              if (playerKey != null) {
-                if (signedMessage != null && !messageNew.equals(signedMessage.getMessage())) {
-                  if (playerKey.getKeyRevision().compareTo(IdentifiedKey.Revision.LINKED_V2) >= 0) {
-                    // Bad, very bad.
-                    logger.fatal("A plugin tried to change a signed chat message. "
-                        + "This is no longer possible in 1.19.1 and newer. "
-                        + "Disconnecting player " + player.getUsername());
-                    player.disconnect(Component.text("A proxy plugin caused an illegal protocol state. "
-                        + "Contact your network administrator."));
-                  } else {
-                    logger.warn("A plugin changed a signed chat message. The server may not accept it.");
-                    return ChatBuilder.builder(player.getProtocolVersion())
-                        .message(messageNew).toServer();
-                  }
-                } else {
-                  return original;
-                }
-              } else {
-                return ChatBuilder.builder(player.getProtocolVersion())
-                    .message(messageNew).toServer();
+              if (player.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_19) >= 0
+                  && player.getIdentifiedKey() != null) {
+                logger.warn("A plugin changed a signed chat message. The server may not accept it.");
               }
+              smc.write(ChatBuilder.builder(player.getProtocolVersion())
+                  .message(event.getMessage()).toServer());
             } else {
-              return original;
-            }
-          } else {
-            if (playerKey != null && playerKey.getKeyRevision().compareTo(IdentifiedKey.Revision.LINKED_V2) >= 0) {
-              logger.fatal("A plugin tried to cancel a signed chat message."
-                  + " This is no longer possible in 1.19.1 and newer. "
-                  + "Disconnecting player " + player.getUsername());
-              player.disconnect(Component.text("A proxy plugin caused an illegal protocol state. "
-                  + "Contact your network administrator."));
+              smc.write(original);
             }
           }
-          return null;
-        })
+        }, smc.eventLoop())
         .exceptionally((ex) -> {
           logger.error("Exception while handling player chat for {}", player, ex);
           return null;
@@ -268,25 +228,23 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(PlayerCommand packet) {
-    player.ensureAndGetCurrentServer();
     if (!validateChat(packet.getCommand())) {
       return true;
     }
     if (!packet.isUnsigned()) {
       SignedChatCommand signedCommand = packet.signedContainer(player.getIdentifiedKey(), player.getUniqueId(), false);
       if (signedCommand != null) {
-        processCommandMessage(packet.getCommand(), signedCommand, packet, packet.getTimestamp());
+        processCommandMessage(packet.getCommand(), signedCommand, packet);
         return true;
       }
     }
 
-    processCommandMessage(packet.getCommand(), null, packet, packet.getTimestamp());
+    processCommandMessage(packet.getCommand(), null, packet);
     return true;
   }
 
   @Override
   public boolean handle(PlayerChat packet) {
-    player.ensureAndGetCurrentServer();
     if (!validateChat(packet.getMessage())) {
       return true;
     }
@@ -311,14 +269,13 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(LegacyChat packet) {
-    player.ensureAndGetCurrentServer();
     String msg = packet.getMessage();
     if (!validateChat(msg)) {
       return true;
     }
 
     if (msg.startsWith("/")) {
-      processCommandMessage(msg.substring(1), null, packet, Instant.now());
+      processCommandMessage(msg.substring(1), null, packet);
     } else {
       processPlayerChat(msg, null, packet);
     }
@@ -738,79 +695,43 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
   }
 
 
-  private CompletableFuture<MinecraftPacket> processCommandExecuteResult(String originalCommand,
-                                                                         CommandResult result,
-                                                                         @Nullable SignedChatCommand signedCommand,
-                                                                         Instant passedTimestamp) {
-    IdentifiedKey playerKey = player.getIdentifiedKey();
+  private CompletableFuture<Void> processCommandExecuteResult(String originalCommand,
+                                                              CommandResult result,
+                                                              @Nullable SignedChatCommand signedCommand) {
     if (result == CommandResult.denied()) {
-      if (playerKey != null) {
-        if (signedCommand != null && playerKey.getKeyRevision()
-            .compareTo(IdentifiedKey.Revision.LINKED_V2) >= 0) {
-          logger.fatal("A plugin tried to deny a command with signable component(s). "
-              + "This is not supported. "
-              + "Disconnecting player " + player.getUsername());
-          player.disconnect(Component.text("A proxy plugin caused an illegal protocol state. "
-              + "Contact your network administrator."));
-        }
-      }
       return CompletableFuture.completedFuture(null);
     }
 
+    MinecraftConnection smc = player.ensureAndGetCurrentServer().ensureConnected();
     String commandToRun = result.getCommand().orElse(originalCommand);
     if (result.isForwardToServer()) {
       ChatBuilder write = ChatBuilder
           .builder(player.getProtocolVersion())
-          .timestamp(passedTimestamp)
           .asPlayer(player);
 
       if (signedCommand != null && commandToRun.equals(signedCommand.getBaseCommand())) {
         write.message(signedCommand);
       } else {
-        if (signedCommand != null && playerKey != null && playerKey.getKeyRevision()
-            .compareTo(IdentifiedKey.Revision.LINKED_V2) >= 0) {
-          logger.fatal("A plugin tried to change a command with signed component(s). "
-              + "This is not supported. "
-              + "Disconnecting player " + player.getUsername());
-          player.disconnect(Component.text("A proxy plugin caused an illegal protocol state. "
-              + "Contact your network administrator."));
-          return CompletableFuture.completedFuture(null);
-        }
         write.message("/" + commandToRun);
       }
-      return CompletableFuture.completedFuture(write.toServer());
+      return CompletableFuture.runAsync(() -> smc.write(write.toServer()), smc.eventLoop());
     } else {
       return server.getCommandManager().executeImmediatelyAsync(player, commandToRun)
-          .thenApply(hasRun -> {
+          .thenAcceptAsync(hasRun -> {
             if (!hasRun) {
               ChatBuilder write = ChatBuilder
                   .builder(player.getProtocolVersion())
-                  .timestamp(passedTimestamp)
                   .asPlayer(player);
 
               if (signedCommand != null && commandToRun.equals(signedCommand.getBaseCommand())) {
                 write.message(signedCommand);
               } else {
-                if (signedCommand != null && playerKey != null && playerKey.getKeyRevision()
-                    .compareTo(IdentifiedKey.Revision.LINKED_V2) >= 0) {
-                  logger.fatal("A plugin tried to change a command with signed component(s). "
-                      + "This is not supported. "
-                      + "Disconnecting player " + player.getUsername());
-                  player.disconnect(Component.text("A proxy plugin caused an illegal protocol state. "
-                      + "Contact your network administrator."));
-                  return null;
-                }
                 write.message("/" + commandToRun);
               }
-              return write.toServer();
+              smc.write(write.toServer());
             }
-            return null;
-          });
+          }, smc.eventLoop());
     }
-  }
-
-  private void handleCommandForward() {
-
   }
 
   /**
@@ -830,3 +751,4 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
   }
 
 }
+
